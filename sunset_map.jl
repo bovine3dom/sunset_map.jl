@@ -77,3 +77,30 @@ record(fig, "sunset_map.mp4", 1:frames; framerate=24) do i
     ga.title = string(Date(dates[i]))
     # sleep(0.1)
 end # overdraw is important - stops weird z-fighting
+
+
+
+# zoomed in on europe
+fig = Figure()
+ga = GeoAxis(
+    fig[1, 1]; # any cell of the figure's layout
+    dest = "+proj=wintri", # the CRS in which you want to plot
+)
+i = 355
+europe = sunsets[-10 .< lons .< 30, 35 .< lats .< 70, i]
+normify = x -> min(max(0, (Time(x) - Time(minimum(europe))).value ./ (Time(maximum(europe)) - Time(minimum(europe))).value), 1)
+# max 0,1 is important otherwise makie helpfully descales our clamping
+
+denormify = x -> string(Time(Nanosecond(Time(minimum(europe)).instant.value + (Time(maximum(europe)) - Time(minimum(europe))).value * x)))
+ga.title = string(Date(dates[i]))
+ylims!(ga, 35, 70)
+xlims!(ga, -10, 30)
+ilat_min = findfirst(x -> x >= 35, lats)
+ilat_max = findlast(x -> x <= 70, lats)
+ilon_min = findfirst(x -> x >= -10, lons)
+ilon_max = findlast(x -> x <= 30, lons)
+
+s = contour!(ga, lons[ilon_min:ilon_max], lats[ilat_min:ilat_max], map(normify, sunsets[ilon_min:ilon_max, ilat_min:ilat_max, i]);  levels=10, colormap = cmap, overdraw=true, labels=true, labelformatter=v -> denormify.(v))
+# s = surface!(ga, lons, lats, map(normify, sunsets[:, :, i]);  colormap = cmap, shading = NoShading, overdraw=true)
+lines!(ga, GeoMakie.coastlines(), overdraw=true, color=:black) # plot coastlines from Natural Earth as a reference
+# Colorbar(fig[1,2], s; tickformat = v -> denormify.(v), ticks=0:0.1:1)
