@@ -1,106 +1,151 @@
-#!/bin/julia
+#!/usr/bin/env julia
 
-import ThreadsX
+module SunsetMap
 
-using Dates
-using Insolation
-import Insolation.Parameters as IP
-import Insolation.OrbitalData
-import ClimaParams as CP
+using Dates, H3.API, TimeZones
+import Arrow, ClimaParams, Insolation, LibGEOS, TimeZoneFinder
 
-# adapted from Insolation tests
-param_set = IP.InsolationParameters(Float32) # ClimaParams has a side effect here, that's fun
-rtol = 1e-2
-od = Insolation.OrbitalData()
+const PARAMETERS = Insolation.Parameters.InsolationParameters(Float64)
+const ORBIT = Insolation.compute_orbital_parameters(PARAMETERS)
+const EPOCH = DateTime(2000, 1, 1, 11, 58, 56, 816)
+const HORIZON = sind(-0.833)
+# UTC instants from https://www.weather.gov/dvn/Climate_Astronomical_Seasons
+const SOLSTICES = (DateTime(2026, 6, 21, 8, 24), DateTime(2026, 12, 21, 20, 50))
 
-date0 = DateTime("2000-01-01T11:58:56.816")
-
-function below_horizon(date, lon, lat)
-    args = (Insolation.helper_instantaneous_zenith_angle(date, date0, od, param_set)...,lon, lat,)
-    sza, azi, d = instantaneous_zenith_angle(args...)
-    return (pi/2 - sza, azi) # height above horizon and e/w direction: azi approx = 2pi => east, approx 1pi => west
+function sunset_utc(date::Date, latitude, longitude)
+    midnight = DateTime(date)
+    estimate = midnight + Millisecond(round(Int, (720 - 4longitude) * 60_000))
+    sinlat, coslat = sincos(deg2rad(latitude))
+    for _ in 1:12
+        _, declination, hourangle = Insolation.distance_declination_hourangle(
+            estimate, EPOCH, ORBIT, PARAMETERS, true,
+        )
+        cosine = (HORIZON - sinlat * sin(declination)) / (coslat * cos(declination))
+        abs(cosine) < 1 || return nothing
+        uncorrected = 2pi * mod(datetime2julian(estimate), 1)
+        equation = mod(hourangle - uncorrected + pi, 2pi) - pi
+        minutes = 720 - 4longitude + (acos(cosine) - equation) * 720 / pi
+        next = midnight + Millisecond(round(Int, minutes * 60_000))
+        abs(Dates.value(next - estimate)) <= 1 && return next
+        estimate = next
+    end
+    error("Sunset solver failed at ($latitude, $longitude) on $date")
 end
 
-# cool so for sunset, sza ~ approx pi/2 and azi ~ approx pi
-function sunset(pos; date=DateTime(2020, 2, 1, 0))
-    argmin(t -> begin
-        horiz, azi = below_horizon(t, pos[1], pos[2]) # lon, lat
-        return abs(horiz) + (azi > 1.5 * pi ? 1000.0 : 0.0) # avoid sunrise, lol
-    end, date .+ (Minute(0):Minute(1):Minute(60*24)))
+function local_sunset(date::Date, latitude, longitude, timezone)
+    event = sunset_utc(date, latitude, longitude)
+    isnothing(event) && return nothing
+    local_event = astimezone(ZonedDateTime(event, tz"UTC"), timezone)
+    # Match the civil date across the date line and for sunsets after midnight.
+    if Date(local_event) != date
+        event = sunset_utc(date + (date - Date(local_event)), latitude, longitude)
+        isnothing(event) && return nothing
+        local_event = astimezone(ZonedDateTime(event, tz"UTC"), timezone)
+    end
+    Date(local_event) == date || return nothing
+    return Dates.value(Time(local_event)) / 60_000_000_000
 end
 
-# lon/lat grid in degrees
-lons = Float32.(-180:5:180)
-lats = Float32.(-90:5:90)
-positions = Iterators.product(lons, lats)
+winter_solstice(latitude) = SOLSTICES[latitude >= 0 ? 2 : 1]
 
-sunsets = ThreadsX.map(sunset, positions) # todo - work out what to do when there is no sunset (currently we're just using lowest point in the west. which is probably fine)
+function winter_sunset(latitude, longitude, timezone)
+    solstice = winter_solstice(latitude)
+    date = Date(astimezone(ZonedDateTime(solstice, tz"UTC"), timezone))
+    return local_sunset(date, latitude, longitude, timezone)
+end
 
-# plotting
-using GLMakie, GeoMakie # cairomakie didn't work for me :(
+function global_cells(resolution::Int)
+    0 <= resolution <= 15 || throw(ArgumentError("H3 resolution must be in 0:15"))
+    cells = UInt64[]
+    sizehint!(cells, getNumCells(resolution))
+    for base in getRes0Cells()
+        append!(cells, cellToChildren(base, resolution))
+    end
+    return cells
+end
 
-GLMakie.activate!()
+split_index(cell::UInt64) = (index_lower=cell % UInt32, index_upper=(cell >> 32) % UInt32)
 
-fig = Figure()
-ga = GeoAxis(
-    fig[1, 1]; # any cell of the figure's layout
-    dest = "+proj=wintri", # the CRS in which you want to plot
-)
-# You can plot your data the same way you would in Makie
-# scatter!(ga, -120:15:120, -60:7.5:60; color = -60:7.5:60, strokecolor = (:black, 0.2))
-# fig
+function timezone_lookup()
+    version = TimeZoneFinder._timezone_boundary_builder_version()
+    data = TimeZoneFinder.load_data(version)
+    context = LibGEOS.GEOSContext()
+    meshes = TimeZoneFinder.Meshes
+    polygons = map(data.shapes) do shape
+        rings = map(meshes.rings(shape.polyarea)) do ring
+            points = [collect(meshes.coordinates(p)) for p in meshes.vertices(ring)]
+            push!(points, first(points))
+        end
+        prepared = LibGEOS.prepareGeom(LibGEOS.Polygon(rings, context))
+        finalizer(LibGEOS.destroyGeom, prepared)
+        prepared
+    end
+    return (tree=LibGEOS.STRtree(polygons; context), zones=IdDict(zip(polygons, data.tzs)), context)
+end
 
-# need a circular colour map where 0:1 are the same
-cmap = to_colormap(:plasma)
+function lookup_timezone(lookup, latitude, longitude)
+    point = LibGEOS.Point(longitude, latitude, lookup.context)
+    try
+        matches = filter(p -> LibGEOS.covers(p, point), LibGEOS.query(lookup.tree, point))
+        isempty(matches) && error("Timezone missing at ($latitude, $longitude)")
+        # Use a stable choice for overlapping timezone boundaries.
+        return lookup.zones[first(sort!(matches; by=p -> string(lookup.zones[p])))]
+    finally
+        finalize(point)
+    end
+end
 
-cmap_circ = [cmap[1:2:256]...; cmap[256:-2:1]...]
+function sunset_table(cells)
+    lookup = timezone_lookup()
+    centres = [cellToLatLng(cell)::LatLng for cell in cells]
+    # GEOS lookups share one context and run serially. Solar calculations use threads.
+    zones = [lookup_timezone(lookup, rad2deg(c.lat), rad2deg(c.lng)) for c in centres]
+    values = fill(Float32(Inf), length(cells))
+    Threads.@threads for i in eachindex(cells)
+        centre = centres[i]
+        minutes = winter_sunset(rad2deg(centre.lat), rad2deg(centre.lng), zones[i])
+        isnothing(minutes) || (values[i] = minutes)
+    end
+    keep = findall(isfinite, values)
+    return (
+        index_lower = [split_index(cells[i]).index_lower for i in keep],
+        index_upper = [split_index(cells[i]).index_upper for i in keep],
+        value = values[keep],
+    )
+end
 
-# s = surface!(ga, lons, lats, map(x -> Time(x).instant.value, sunsets) ./ Time(23,59,59,999).instant.value;  colormap = cmap_circ, shading = NoShading)
-nsfrac2time = x -> string(Time(Nanosecond(round(x * Time(23,59,59,999).instant.value))))
-Colorbar(fig[1,2], s; tickformat = v -> nsfrac2time.(v))
+function generate(output="sunset_2026_r5.arrow"; resolution=5)
+    @info "Enumerating H3 cells" resolution
+    cells = global_cells(resolution)
+    @info "Calculating local sunsets" cells=length(cells) threads=Threads.nthreads()
+    table = sunset_table(cells)
+    Arrow.write(output, table; compress=nothing, dictencode=false, metadata=Dict(
+        "value_units" => "minutes since local midnight",
+        "year" => "2026",
+        "h3_resolution" => string(resolution),
+        "solstices_utc" => join(string.(SOLSTICES), ","),
+        "date_rule" => "local civil date containing each solstice instant",
+        "selection" => "December solstice at latitude >= 0; June solstice at latitude < 0",
+        "solar_altitude_degrees" => "-0.833",
+        "timezone_boundaries" => TimeZoneFinder._timezone_boundary_builder_version(),
+        "boundary_source" => "timezone-boundary-builder; OpenStreetMap contributors",
+        "boundary_license" => "https://opendatacommons.org/licenses/odbl/1-0/",
+        "tzdata" => TimeZones.TZData.tzdata_version(),
+        "timezone_overlap_rule" => "lexicographically first timezone identifier",
+    ))
+    @info "Wrote Arrow file" output rows=length(table.value) omitted=length(cells)-length(table.value)
+    return table
+end
 
-lines!(ga, GeoMakie.coastlines(), overdraw=true, color=:black) # plot coastlines from Natural Earth as a reference
+function main(args)
+    length(args) <= 2 || throw(ArgumentError("Usage: sunset_map.jl [output.arrow] [resolution]"))
+    output = isempty(args) ? "sunset_2026_r5.arrow" : args[1]
+    resolution = length(args) == 2 ? parse(Int, args[2]) : 5
+    @time generate(output; resolution)
+end
 
-# animation
-dates = DateTime(2020, 1, 1, 0):Day(1):DateTime(2021, 1, 1, 0)
-positionstimes = Iterators.product(lons, lats, dates)
+end
 
-sunsets = ThreadsX.map(x->sunset([x[1], x[2]], date=x[3]), positionstimes) # todo - work out what to do when there is no sunset (currently we're just using lowest point in the west. which is probably fine)
-
-frames = size(sunsets)[3]
-# record(fig, "sunset_map.mp4", 1:frames; framerate=10) do i
-# end
-#for i in 1:frames
-record(fig, "sunset_map.mp4", 1:frames; framerate=24) do i
-    surface!(ga, lons, lats, map(x -> Time(x).instant.value, sunsets[:, :, i]) ./ Time(23,59,59,999).instant.value;  colormap = cmap_circ, shading = NoShading, overdraw=true)
-    lines!(ga, GeoMakie.coastlines(), overdraw=true, color=:black) # plot coastlines from Natural Earth as a reference
-    ga.title = string(Date(dates[i]))
-    # sleep(0.1)
-end # overdraw is important - stops weird z-fighting
-
-
-
-# zoomed in on europe
-fig = Figure()
-ga = GeoAxis(
-    fig[1, 1]; # any cell of the figure's layout
-    dest = "+proj=wintri", # the CRS in which you want to plot
-)
-i = 355
-europe = sunsets[-10 .< lons .< 30, 35 .< lats .< 70, i]
-normify = x -> min(max(0, (Time(x) - Time(minimum(europe))).value ./ (Time(maximum(europe)) - Time(minimum(europe))).value), 1)
-# max 0,1 is important otherwise makie helpfully descales our clamping
-
-denormify = x -> string(Time(Nanosecond(Time(minimum(europe)).instant.value + (Time(maximum(europe)) - Time(minimum(europe))).value * x)))
-ga.title = string(Date(dates[i]))
-ylims!(ga, 35, 70)
-xlims!(ga, -10, 30)
-ilat_min = findfirst(x -> x >= 35, lats)
-ilat_max = findlast(x -> x <= 70, lats)
-ilon_min = findfirst(x -> x >= -10, lons)
-ilon_max = findlast(x -> x <= 30, lons)
-
-s = contour!(ga, lons[ilon_min:ilon_max], lats[ilat_min:ilat_max], map(normify, sunsets[ilon_min:ilon_max, ilat_min:ilat_max, i]);  levels=10, colormap = cmap, overdraw=true, labels=true, labelformatter=v -> denormify.(v))
-# s = surface!(ga, lons, lats, map(normify, sunsets[:, :, i]);  colormap = cmap, shading = NoShading, overdraw=true)
-lines!(ga, GeoMakie.coastlines(), overdraw=true, color=:black) # plot coastlines from Natural Earth as a reference
-# Colorbar(fig[1,2], s; tickformat = v -> denormify.(v), ticks=0:0.1:1)
+if abspath(PROGRAM_FILE) == @__FILE__
+    SunsetMap.main(ARGS)
+end

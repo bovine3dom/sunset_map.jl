@@ -1,7 +1,19 @@
 [deps]
-CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
 ClimaParams = "5c42b081-d73a-476f-9059-fd94b934656c"
-GLMakie = "e9467ef8-e4e7-5192-8a1a-b1aee30e663a"
-GeoMakie = "db073c08-6b98-4ee5-b6a4-5efafb3259c6"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+H3 = "f62fece2-b996-571a-b4c9-e662aba1c617"
 Insolation = "e98cc03f-d57e-4e3c-b70c-8d51efe9e0d8"
-ThreadsX = "ac1d9e8a-700a-412c-b207-f0111f4b6c0d"
+LibGEOS = "a90b1aa1-3769-5649-ba7e-abc5a9d163eb"
+TimeZoneFinder = "3ccf6684-3f25-4581-8c58-114637dcab4a"
+TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
+
+[compat]
+Arrow = "2.8"
+ClimaParams = "0.10"
+H3 = "0.3"
+Insolation = "=0.9.4"
+LibGEOS = "0.9"
+TimeZoneFinder = "0.6"
+TimeZones = "1"
+julia = "1.12"
