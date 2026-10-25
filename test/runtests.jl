@@ -28,8 +28,22 @@ cell(lat, lon) = latLngToCell(LatLng(deg2rad(lat), deg2rad(lon)), 5)
     end
     @test isnothing(SunsetMap.local_sunset(Date(2026,12,21), 69.6492, 18.9553, zone("Europe/Oslo")))
     @test isnothing(SunsetMap.local_sunset(Date(2026,6,21), 69.6492, 18.9553, zone("Europe/Oslo")))
+    # Independent sea-level sunrise references from Astral 3.2, in local minutes.
+    for (date, lat, lon, timezone, expected) in [
+        (Date(2026,12,21), 51.5072, -0.1276, "Europe/London", 483.718),
+        (Date(2026,6,21), -33.8688, 151.2093, "Australia/Sydney", 419.663),
+        (Date(2026,12,21), 21.3099, -157.8581, "Pacific/Honolulu", 424.613),
+        (Date(2026,6,21), 61.2181, -149.9003, "America/Anchorage", 260.066),
+    ]
+        actual = SunsetMap.local_sunrise(date, lat, lon, zone(timezone))
+        @test isapprox(actual, expected; atol=1.5)
+    end
+    @test isnothing(SunsetMap.local_sunrise(Date(2026,12,21), 69.6492, 18.9553, zone("Europe/Oslo")))
+    @test isnothing(SunsetMap.local_sunrise(Date(2026,6,21), 69.6492, 18.9553, zone("Europe/Oslo")))
     @test isnothing(SunsetMap.winter_sunset(-75.0, 0.0, tz"UTC"))
+    @test isnothing(SunsetMap.winter_sunrise(-75.0, 0.0, tz"UTC"))
     @test SunsetMap.winter_sunset(64.1466, -21.9426, zone("Atlantic/Reykjavik")) > 900
+    @test 600 < SunsetMap.winter_sunrise(64.1466, -21.9426, zone("Atlantic/Reykjavik")) < 900
     @test SunsetMap.winter_sunset(-33.8688, 151.2093, zone("Australia/Sydney")) < 1020
     @test SunsetMap.winter_solstice(0.0) == SunsetMap.SOLSTICES[2]
 
@@ -76,6 +90,10 @@ end
 @testset "Arrow output" begin
     cells = [cell(51.5072,-0.1276), cell(-33.8688,151.2093), cell(69.6492,18.9553), cell(-75,0)]
     table = SunsetMap.sunset_table(cells)
+    sunrise = SunsetMap.sunrise_table(cells)
+    @test length(sunrise.value) == 2
+    @test all(v -> 0 <= v < 1440, sunrise.value)
+    @test all(sunrise.value .< table.value)
     @test length(table.value) == 2
     @test all(v -> 0 <= v < 1440, table.value)
     indices = UInt64.(table.index_lower) .| (UInt64.(table.index_upper) .<< 32)
@@ -92,7 +110,11 @@ end
         @test restored.value == generated.value
         @test restored.index_lower == generated.index_lower
         @test restored.index_upper == generated.index_upper
+        @test Arrow.getmetadata(restored)["solar_event"] == "sunset"
         @test Arrow.getmetadata(restored)["value_units"] == "minutes since local midnight"
         @test all(v -> isfinite(v) && 0 <= v < 1440, restored.value)
+        sunrise_path = joinpath(dir, "sunrise.arrow")
+        SunsetMap.main([sunrise_path, "0", "--sunrise"])
+        @test Arrow.getmetadata(Arrow.Table(sunrise_path))["solar_event"] == "sunrise"
     end
 end

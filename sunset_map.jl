@@ -12,10 +12,11 @@ const HORIZON = sind(-0.833)
 # UTC instants from https://www.weather.gov/dvn/Climate_Astronomical_Seasons
 const SOLSTICES = (DateTime(2026, 6, 21, 8, 24), DateTime(2026, 12, 21, 20, 50))
 
-function sunset_utc(date::Date, latitude, longitude)
+function solar_event_utc(date::Date, latitude, longitude, sunrise::Bool)
     midnight = DateTime(date)
     estimate = midnight + Millisecond(round(Int, (720 - 4longitude) * 60_000))
     sinlat, coslat = sincos(deg2rad(latitude))
+    direction = sunrise ? -1 : 1
     for _ in 1:12
         _, declination, hourangle = Insolation.distance_declination_hourangle(
             estimate, EPOCH, ORBIT, PARAMETERS, true,
@@ -24,21 +25,26 @@ function sunset_utc(date::Date, latitude, longitude)
         abs(cosine) < 1 || return nothing
         uncorrected = 2pi * mod(datetime2julian(estimate), 1)
         equation = mod(hourangle - uncorrected + pi, 2pi) - pi
-        minutes = 720 - 4longitude + (acos(cosine) - equation) * 720 / pi
+        minutes = 720 - 4longitude + (direction * acos(cosine) - equation) * 720 / pi
         next = midnight + Millisecond(round(Int, minutes * 60_000))
         abs(Dates.value(next - estimate)) <= 1 && return next
         estimate = next
     end
-    error("Sunset solver failed at ($latitude, $longitude) on $date")
+    name = sunrise ? "Sunrise" : "Sunset"
+    error("$name solver failed at ($latitude, $longitude) on $date")
 end
 
-function local_sunset(date::Date, latitude, longitude, timezone)
-    event = sunset_utc(date, latitude, longitude)
+sunset_utc(date::Date, latitude, longitude) = solar_event_utc(date, latitude, longitude, false)
+sunrise_utc(date::Date, latitude, longitude) = solar_event_utc(date, latitude, longitude, true)
+
+function local_solar_event(date::Date, latitude, longitude, timezone, sunrise::Bool)
+    calculate = sunrise ? sunrise_utc : sunset_utc
+    event = calculate(date, latitude, longitude)
     isnothing(event) && return nothing
     local_event = astimezone(ZonedDateTime(event, tz"UTC"), timezone)
-    # Match the civil date across the date line and for sunsets after midnight.
+    # Match the local civil date across the date line.
     if Date(local_event) != date
-        event = sunset_utc(date + (date - Date(local_event)), latitude, longitude)
+        event = calculate(date + (date - Date(local_event)), latitude, longitude)
         isnothing(event) && return nothing
         local_event = astimezone(ZonedDateTime(event, tz"UTC"), timezone)
     end
@@ -46,13 +52,24 @@ function local_sunset(date::Date, latitude, longitude, timezone)
     return Dates.value(Time(local_event)) / 60_000_000_000
 end
 
+local_sunset(date::Date, latitude, longitude, timezone) =
+    local_solar_event(date, latitude, longitude, timezone, false)
+local_sunrise(date::Date, latitude, longitude, timezone) =
+    local_solar_event(date, latitude, longitude, timezone, true)
+
 winter_solstice(latitude) = SOLSTICES[latitude >= 0 ? 2 : 1]
 
-function winter_sunset(latitude, longitude, timezone)
+function winter_solar_event(latitude, longitude, timezone, sunrise::Bool)
     solstice = winter_solstice(latitude)
     date = Date(astimezone(ZonedDateTime(solstice, tz"UTC"), timezone))
-    return local_sunset(date, latitude, longitude, timezone)
+    calculate = sunrise ? local_sunrise : local_sunset
+    return calculate(date, latitude, longitude, timezone)
 end
+
+winter_sunset(latitude, longitude, timezone) =
+    winter_solar_event(latitude, longitude, timezone, false)
+winter_sunrise(latitude, longitude, timezone) =
+    winter_solar_event(latitude, longitude, timezone, true)
 
 function global_cells(resolution::Int)
     0 <= resolution <= 15 || throw(ArgumentError("H3 resolution must be in 0:15"))
@@ -95,7 +112,9 @@ function lookup_timezone(lookup, latitude, longitude)
     end
 end
 
-function sunset_table(cells)
+function solar_event_table(cells; event=:sunset)
+    event in (:sunrise, :sunset) || throw(ArgumentError("event must be :sunrise or :sunset"))
+    calculate = event === :sunrise ? winter_sunrise : winter_sunset
     lookup = timezone_lookup()
     centres = [cellToLatLng(cell)::LatLng for cell in cells]
     # GEOS lookups share one context and run serially. Solar calculations use threads.
@@ -103,7 +122,7 @@ function sunset_table(cells)
     values = fill(Float32(Inf), length(cells))
     Threads.@threads for i in eachindex(cells)
         centre = centres[i]
-        minutes = winter_sunset(rad2deg(centre.lat), rad2deg(centre.lng), zones[i])
+        minutes = calculate(rad2deg(centre.lat), rad2deg(centre.lng), zones[i])
         isnothing(minutes) || (values[i] = minutes)
     end
     keep = findall(isfinite, values)
@@ -114,12 +133,18 @@ function sunset_table(cells)
     )
 end
 
-function generate(output="sunset_2026_r5.arrow"; resolution=5)
+sunset_table(cells) = solar_event_table(cells; event=:sunset)
+sunrise_table(cells) = solar_event_table(cells; event=:sunrise)
+
+function generate(output=nothing; resolution=5, event=:sunset)
+    event in (:sunrise, :sunset) || throw(ArgumentError("event must be :sunrise or :sunset"))
+    output = isnothing(output) ? "$(event)_2026_r$(resolution).arrow" : output
     @info "Enumerating H3 cells" resolution
     cells = global_cells(resolution)
-    @info "Calculating local sunsets" cells=length(cells) threads=Threads.nthreads()
-    table = sunset_table(cells)
+    @info "Calculating local $event times" cells=length(cells) threads=Threads.nthreads()
+    table = solar_event_table(cells; event)
     Arrow.write(output, table; compress=nothing, dictencode=false, metadata=Dict(
+        "solar_event" => string(event),
         "value_units" => "minutes since local midnight",
         "year" => "2026",
         "h3_resolution" => string(resolution),
@@ -138,10 +163,14 @@ function generate(output="sunset_2026_r5.arrow"; resolution=5)
 end
 
 function main(args)
-    length(args) <= 2 || throw(ArgumentError("Usage: sunset_map.jl [output.arrow] [resolution]"))
-    output = isempty(args) ? "sunset_2026_r5.arrow" : args[1]
-    resolution = length(args) == 2 ? parse(Int, args[2]) : 5
-    @time generate(output; resolution)
+    sunrise = "--sunrise" in args
+    positional = filter(!=("--sunrise"), args)
+    length(positional) <= 2 || throw(ArgumentError(
+        "Usage: sunset_map.jl [--sunrise] [output.arrow] [resolution]",
+    ))
+    output = isempty(positional) ? nothing : positional[1]
+    resolution = length(positional) == 2 ? parse(Int, positional[2]) : 5
+    @time generate(output; resolution, event=sunrise ? :sunrise : :sunset)
 end
 
 end
