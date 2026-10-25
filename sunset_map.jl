@@ -57,19 +57,30 @@ local_sunset(date::Date, latitude, longitude, timezone) =
 local_sunrise(date::Date, latitude, longitude, timezone) =
     local_solar_event(date, latitude, longitude, timezone, true)
 
-winter_solstice(latitude) = SOLSTICES[latitude >= 0 ? 2 : 1]
+function seasonal_solstice(latitude, season::Symbol)
+    season in (:summer, :winter) || throw(ArgumentError("season must be :summer or :winter"))
+    summer = season === :summer
+    return SOLSTICES[latitude >= 0 ? (summer ? 1 : 2) : (summer ? 2 : 1)]
+end
 
-function winter_solar_event(latitude, longitude, timezone, sunrise::Bool)
-    solstice = winter_solstice(latitude)
+winter_solstice(latitude) = seasonal_solstice(latitude, :winter)
+summer_solstice(latitude) = seasonal_solstice(latitude, :summer)
+
+function seasonal_solar_event(latitude, longitude, timezone, sunrise::Bool, season::Symbol)
+    solstice = seasonal_solstice(latitude, season)
     date = Date(astimezone(ZonedDateTime(solstice, tz"UTC"), timezone))
     calculate = sunrise ? local_sunrise : local_sunset
     return calculate(date, latitude, longitude, timezone)
 end
 
 winter_sunset(latitude, longitude, timezone) =
-    winter_solar_event(latitude, longitude, timezone, false)
+    seasonal_solar_event(latitude, longitude, timezone, false, :winter)
 winter_sunrise(latitude, longitude, timezone) =
-    winter_solar_event(latitude, longitude, timezone, true)
+    seasonal_solar_event(latitude, longitude, timezone, true, :winter)
+summer_sunset(latitude, longitude, timezone) =
+    seasonal_solar_event(latitude, longitude, timezone, false, :summer)
+summer_sunrise(latitude, longitude, timezone) =
+    seasonal_solar_event(latitude, longitude, timezone, true, :summer)
 
 function global_cells(resolution::Int)
     0 <= resolution <= 15 || throw(ArgumentError("H3 resolution must be in 0:15"))
@@ -112,9 +123,14 @@ function lookup_timezone(lookup, latitude, longitude)
     end
 end
 
-function solar_event_table(cells; event=:sunset)
+function solar_event_table(cells; event=:sunset, season=:winter)
     event in (:sunrise, :sunset) || throw(ArgumentError("event must be :sunrise or :sunset"))
-    calculate = event === :sunrise ? winter_sunrise : winter_sunset
+    season in (:summer, :winter) || throw(ArgumentError("season must be :summer or :winter"))
+    calculate = if season === :summer
+        event === :sunrise ? summer_sunrise : summer_sunset
+    else
+        event === :sunrise ? winter_sunrise : winter_sunset
+    end
     lookup = timezone_lookup()
     centres = [cellToLatLng(cell)::LatLng for cell in cells]
     # GEOS lookups share one context and run serially. Solar calculations use threads.
@@ -136,21 +152,26 @@ end
 sunset_table(cells) = solar_event_table(cells; event=:sunset)
 sunrise_table(cells) = solar_event_table(cells; event=:sunrise)
 
-function generate(output=nothing; resolution=5, event=:sunset)
+function generate(output=nothing; resolution=5, event=:sunset, season=:winter)
     event in (:sunrise, :sunset) || throw(ArgumentError("event must be :sunrise or :sunset"))
-    output = isnothing(output) ? "$(event)_2026_r$(resolution).arrow" : output
+    season in (:summer, :winter) || throw(ArgumentError("season must be :summer or :winter"))
+    prefix = season === :summer ? "summer_" : ""
+    output = isnothing(output) ? "$(prefix)$(event)_2026_r$(resolution).arrow" : output
     @info "Enumerating H3 cells" resolution
     cells = global_cells(resolution)
-    @info "Calculating local $event times" cells=length(cells) threads=Threads.nthreads()
-    table = solar_event_table(cells; event)
+    @info "Calculating local $season $event times" cells=length(cells) threads=Threads.nthreads()
+    table = solar_event_table(cells; event, season)
     Arrow.write(output, table; compress=nothing, dictencode=false, metadata=Dict(
         "solar_event" => string(event),
+        "season" => string(season),
         "value_units" => "minutes since local midnight",
         "year" => "2026",
         "h3_resolution" => string(resolution),
         "solstices_utc" => join(string.(SOLSTICES), ","),
         "date_rule" => "local civil date containing each solstice instant",
-        "selection" => "December solstice at latitude >= 0; June solstice at latitude < 0",
+        "selection" => season === :winter ?
+            "December solstice at latitude >= 0; June solstice at latitude < 0" :
+            "June solstice at latitude >= 0; December solstice at latitude < 0",
         "solar_altitude_degrees" => "-0.833",
         "timezone_boundaries" => TimeZoneFinder._timezone_boundary_builder_version(),
         "boundary_source" => "timezone-boundary-builder; OpenStreetMap contributors",
@@ -164,13 +185,15 @@ end
 
 function main(args)
     sunrise = "--sunrise" in args
-    positional = filter(!=("--sunrise"), args)
+    summer = "--summer" in args
+    positional = filter(arg -> !(arg in ("--sunrise", "--summer")), args)
     length(positional) <= 2 || throw(ArgumentError(
-        "Usage: sunset_map.jl [--sunrise] [output.arrow] [resolution]",
+        "Usage: sunset_map.jl [--sunrise] [--summer] [output.arrow] [resolution]",
     ))
     output = isempty(positional) ? nothing : positional[1]
     resolution = length(positional) == 2 ? parse(Int, positional[2]) : 5
-    @time generate(output; resolution, event=sunrise ? :sunrise : :sunset)
+    @time generate(output; resolution, event=sunrise ? :sunrise : :sunset,
+        season=summer ? :summer : :winter)
 end
 
 end

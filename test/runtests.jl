@@ -46,6 +46,13 @@ cell(lat, lon) = latLngToCell(LatLng(deg2rad(lat), deg2rad(lon)), 5)
     @test 600 < SunsetMap.winter_sunrise(64.1466, -21.9426, zone("Atlantic/Reykjavik")) < 900
     @test SunsetMap.winter_sunset(-33.8688, 151.2093, zone("Australia/Sydney")) < 1020
     @test SunsetMap.winter_solstice(0.0) == SunsetMap.SOLSTICES[2]
+    @test SunsetMap.summer_solstice(0.0) == SunsetMap.SOLSTICES[1]
+    @test SunsetMap.summer_solstice(-33.8688) == SunsetMap.SOLSTICES[2]
+    london = zone("Europe/London")
+    @test SunsetMap.summer_sunset(51.5072, -0.1276, london) >
+        SunsetMap.winter_sunset(51.5072, -0.1276, london)
+    @test SunsetMap.summer_sunrise(51.5072, -0.1276, london) <
+        SunsetMap.winter_sunrise(51.5072, -0.1276, london)
 
     # Solstice dates follow civil time on both sides of the date line.
     june, december = ZonedDateTime.(SunsetMap.SOLSTICES, Ref(tz"UTC"))
@@ -113,8 +120,12 @@ end
         @test Arrow.getmetadata(restored)["solar_event"] == "sunset"
         @test Arrow.getmetadata(restored)["value_units"] == "minutes since local midnight"
         @test all(v -> isfinite(v) && 0 <= v < 1440, restored.value)
-        sunrise_path = joinpath(dir, "sunrise.arrow")
-        SunsetMap.main([sunrise_path, "0", "--sunrise"])
-        @test Arrow.getmetadata(Arrow.Table(sunrise_path))["solar_event"] == "sunrise"
+        summer_path = joinpath(dir, "summer_sunrise.arrow")
+        SunsetMap.main([summer_path, "0", "--sunrise", "--summer"])
+        metadata = Arrow.getmetadata(Arrow.Table(summer_path))
+        @test metadata["solar_event"] == "sunrise"
+        @test metadata["season"] == "summer"
+        @test metadata["selection"] ==
+            "June solstice at latitude >= 0; December solstice at latitude < 0"
     end
 end

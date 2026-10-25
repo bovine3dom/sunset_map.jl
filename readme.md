@@ -1,4 +1,4 @@
-# Winter sunrise and sunset maps
+# Solstice sunrise and sunset maps
 
 Create an Arrow file of local sunrise or sunset times for the world at H3 resolution 5.
 
@@ -18,11 +18,15 @@ Create `sunset_2026_r5.arrow` with sunset times:
 julia --project=. --threads=auto sunset_map.jl
 ```
 
-Add `--sunrise` to create `sunrise_2026_r5.arrow` with sunrise times:
+Add `--sunrise` to create `sunrise_2026_r5.arrow` with sunrise times. Add `--summer` to use the summer solstice for each hemisphere. By default, the map uses the winter solstice.
 
 ```sh
 julia --project=. --threads=auto sunset_map.jl --sunrise
+julia --project=. --threads=auto sunset_map.jl --summer
+julia --project=. --threads=auto sunset_map.jl --sunrise --summer
 ```
+
+The summer output names start with `summer_`, for example `summer_sunset_2026_r5.arrow` and `summer_sunrise_2026_r5.arrow`.
 
 ## Arrow columns (H3-MON schema)
 
