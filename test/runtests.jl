@@ -53,6 +53,10 @@ cell(lat, lon) = latLngToCell(LatLng(deg2rad(lat), deg2rad(lon)), 5)
         SunsetMap.winter_sunset(51.5072, -0.1276, london)
     @test SunsetMap.summer_sunrise(51.5072, -0.1276, london) <
         SunsetMap.winter_sunrise(51.5072, -0.1276, london)
+    noon = SunsetMap.winter_noon(51.5072, -0.1276, london)
+    @test SunsetMap.local_sunrise(Date(2026,12,21), 51.5072, -0.1276, london) < noon <
+        SunsetMap.local_sunset(Date(2026,12,21), 51.5072, -0.1276, london)
+    @test 0 <= SunsetMap.winter_noon(-75.0, 0.0, tz"UTC") < 1440
 
     # Solstice dates follow civil time on both sides of the date line.
     june, december = ZonedDateTime.(SunsetMap.SOLSTICES, Ref(tz"UTC"))
@@ -60,6 +64,8 @@ cell(lat, lon) = latLngToCell(LatLng(deg2rad(lat), deg2rad(lon)), 5)
     @test Date(astimezone(december, zone("Pacific/Kiritimati"))) == Date(2026,12,22)
     @test SunsetMap.winter_sunset(1.8721, -157.4278, zone("Pacific/Kiritimati")) ≈
         SunsetMap.local_sunset(Date(2026,12,22), 1.8721, -157.4278, zone("Pacific/Kiritimati"))
+    @test SunsetMap.winter_noon(1.8721, -157.4278, zone("Pacific/Kiritimati")) ≈
+        SunsetMap.local_solar_noon(Date(2026,12,22), 1.8721, -157.4278, zone("Pacific/Kiritimati"))
 end
 
 @testset "H3 indices" begin
@@ -98,6 +104,9 @@ end
     cells = [cell(51.5072,-0.1276), cell(-33.8688,151.2093), cell(69.6492,18.9553), cell(-75,0)]
     table = SunsetMap.sunset_table(cells)
     sunrise = SunsetMap.sunrise_table(cells)
+    noon = SunsetMap.noon_table(cells)
+    @test length(noon.value) == length(cells)
+    @test all(v -> 0 <= v < 1440, noon.value)
     @test length(sunrise.value) == 2
     @test all(v -> 0 <= v < 1440, sunrise.value)
     @test all(sunrise.value .< table.value)
@@ -127,5 +136,11 @@ end
         @test metadata["season"] == "summer"
         @test metadata["selection"] ==
             "June solstice at latitude >= 0; December solstice at latitude < 0"
+        noon_path = joinpath(dir, "solar_noon.arrow")
+        SunsetMap.main([noon_path, "0", "--noon", "--summer"])
+        noon_metadata = Arrow.getmetadata(Arrow.Table(noon_path))
+        @test noon_metadata["solar_event"] == "solar_noon"
+        @test noon_metadata["season"] == "summer"
+        @test noon_metadata["solar_altitude_degrees"] == "not applicable"
     end
 end
